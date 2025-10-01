@@ -1,0 +1,7 @@
+apache-airflow-providers-http
+apache-airflow-providers-mysql
+requests
+pandas
+scikit-learn
+mlflow
+boto3

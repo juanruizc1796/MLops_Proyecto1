@@ -1,0 +1,114 @@
+version: "3.9"
+
+services:
+  # ---------------------------
+  # MySQL: backend de metadatos para MLflow
+  # ---------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./mysql_data:/var/lib/mysql
+      - ./configs/mysql-init.sql:/docker-entrypoint-initdb.d/mysql-init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ---------------------------
+  # MinIO: artifact store (simula S3)
+  # ---------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    restart: always
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # consola web
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ---------------------------
+  # MLflow: servidor de tracking
+  # ---------------------------
+  mlflow:
+    build: ./mlflow
+    container_name: mlflow
+    restart: always
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command: >
+      server --host 0.0.0.0 --port 5000
+      --backend-store-uri mysql+pymysql://mlflow:mlflow@mysql:3306/mlflow
+      --artifacts-destination s3://mlflow
+    ports:
+      - "5000:5000"
+
+  # ---------------------------
+  # FastAPI: servicio de inferencia
+  # ---------------------------
+  fastapi:
+    build:
+      context: ./fastapi
+    container_name: fastapi
+    restart: always
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: cover_type_model
+      MODEL_STAGE: Production
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mlflow
+
+  # ---------------------------
+  # Airflow: orquestador de pipelines
+  # ---------------------------
+  airflow:
+    image: apache/airflow:2.8.1
+    container_name: airflow
+    restart: always
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: mysql+mysqldb://mlflow:mlflow@mysql:3306/mlflow
+      AIRFLOW__CORE__FERNET_KEY: "fernet_key_aqui"  # genera uno con `openssl rand -base64 32`
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-mysql apache-airflow-providers-http pandas requests scikit-learn mlflow boto3"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  minio_data:
